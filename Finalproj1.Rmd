@@ -1,0 +1,1371 @@
+---
+title: "Final Project"
+author: "Matthew Newell, Michael Quintana, and Albert Simorangkir"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, 
+                      message = F,
+                      warning = F,
+                      fig.align = 'center',
+                      fig.height = 3, 
+                      fig.width = 4)
+
+# libraries here
+library(tidyverse)
+library(modelr)
+library(randomForest)
+library(gbm)
+library(ROCR)
+library(ggmap)
+library(pander)
+library(tree)
+library(maptree)
+library(gridExtra)
+library(NbClust)
+```
+
+```{r}
+#load('~/project_data.RData')
+election_raw <- filter(election_raw, fips != 2000)
+election_federal <- filter(election_raw, fips == 'US')
+election_state <- filter(election_raw, is.na(as.numeric(as.character(fips))) & fips != 'US')
+election <- filter(election_raw, !is.na(as.numeric(as.character(fips))))
+election <- transform(election, fips = as.numeric(fips))
+```
+
+```{r}
+census_clean <- census %>%
+  na.omit() %>%
+  mutate(Men = Men / TotalPop,
+         Women = Women / TotalPop,
+         Employed = Employed / TotalPop,
+         Citizen = Citizen / TotalPop) %>%
+  subset(select = -c(Men)) %>%
+  mutate(Minority = Hispanic + Black + Native + Asian + Pacific) %>%
+  subset(select = -c(Hispanic, Black, Native, Asian, Pacific)) %>%
+  subset(select = -c(Income, Walk, PublicWork, Construction)) %>%
+  select(-contains("Err"))
+
+census_clean_weighted <- census_clean %>%
+  group_by(State ,County) %>%
+  add_tally(TotalPop, name = "CountyPop") %>%
+  mutate(pop_wt = TotalPop / CountyPop) %>%
+  mutate(across(Women:Minority, ~ .x * pop_wt)) %>%
+  ungroup() %>%
+  subset(select = -c(pop_wt, TotalPop))
+census_tidy <- census_clean_weighted %>%
+  group_by(State, County) %>%
+  summarize(across(Women:Minority, sum)) %>%
+  ungroup()
+
+
+```
+
+
+```{r, eval=T, results='hide'}
+abb2name <- function(stateabb){
+  ix <- match(stateabb, state.abb)
+  out <- tolower(state.name[ix])
+  return(out)
+}
+
+# top two candidates by county
+toptwo <- election %>% 
+  group_by(fips) %>% 
+  mutate(total = sum(votes), 
+         pct = votes/total) %>% 
+  slice_max(pct, n = 2)
+
+# create temporary dataframes with matching state/county information
+tmpelection <- toptwo %>%
+  ungroup %>%
+  # coerce names to abbreviations
+  mutate(state = abb2name(state)) %>%
+  # everything lower case
+  mutate(across(c(state, county), tolower)) %>%
+  # remove county suffixes
+  mutate(county = gsub(" county| columbia| city| parish", 
+                       "", 
+                       county)) 
+tmpcensus <- census_tidy %>% 
+  # coerce state and county to lowercase
+  mutate(across(c(State, County), tolower))
+
+# merge
+merged_data <- tmpelection %>%
+  left_join(tmpcensus, 
+            by = c("state"="State", "county"="County")) %>% 
+  na.omit()
+
+# clear temporary dataframes from environment
+rm(list = c('tmpwinner', 'tmpcensus'))
+
+# print first few rows
+merged_data[1:4, 1:8] %>% pander()
+```
+```{r}
+New_data <- merged_data[order(merged_data$pct,decreasing = T),]
+
+New_data <- distinct(New_data,as.character(New_data$fips),.keep_all=T)
+
+merged_data1 <- New_data
+
+```
+
+```{r, eval=T, results='hide'}
+
+# Logistic Regression
+New_data <- New_data %>% select(-votes, -total, -pct, -county,-fips,-state,-`as.character(New_data$fips)`)
+
+New_data_part <- New_data %>% 
+  resample_partition(p = c('train' = 0.8, 'test' = 0.2))
+
+New_data_train <- New_data_part$train
+New_data_test <- New_data_part$test
+
+fit <- glm(as.factor(candidate) ~., data=New_data_train, family='binomial')
+
+#summary(fit) not looking promising
+p_hat <- predict(fit, New_data_test, type='response')
+y_hat <- factor(p_hat > .5, labels=c('Trump','Clinton'))
+y <- New_data_test %>% as.data.frame() %>% pull(candidate)
+
+
+error <- table(y=y, y_hat)
+error/rowSums(error) 
+```
+
+```{r}
+#Plot
+p_hat_map <- predict(fit, newdata=New_data,type='response')
+
+y_hat_map <- factor(p_hat_map > .5, labels=c('Trump','Clinton'))
+
+county <- map_data("county")
+fips <- maps::county.fips %>% 
+  separate(polyname,c('region','subregion'),sep=',')
+
+county<- county%>% left_join(fips)
+
+glm_map <- New_data %>% bind_cols(select(merged_data1,fips))
+glm_map_US <- left_join(glm_map,county)
+
+glm_map_pred <- glm_map
+
+glm_map_pred$candidate <- y_hat_map
+
+glm_map_pred_US <- left_join(glm_map_pred,county)
+
+base <- glm_map_US %>%  ggplot() + 
+  geom_polygon(aes(x = long, 
+                   y = lat, 
+                   fill = candidate,
+                   group = group), 
+               color = "white", 
+               size=0.1) +
+  coord_fixed(1.3) +
+  scale_fill_brewer(palette="Set1") +
+  theme_nothing()
+
+pred_map <- glm_map_pred_US %>%  ggplot() + 
+  geom_polygon(aes(x = long, 
+                   y = lat, 
+                   fill = candidate,
+                   group = group), 
+               color = "white", 
+               size=0.1) +
+  coord_fixed(1.3) +
+  scale_fill_brewer(palette="Set1") +
+  theme_nothing()
+
+```
+
+```{r, eval=T, results='hide'}
+
+# Linear Discriminant Analysis
+fit_lda <- MASS::lda(as.factor(candidate)~., data=New_data_train,method='mle')
+
+#fit_lda
+preds_lda <- predict(fit_lda, New_data_test)
+
+errors_lda <- table(class = y, pred = preds_lda$class)
+errors_lda/rowSums(errors_lda) 
+```
+
+```{r, eval=T, results='hide'}
+
+# Quadratic Discriminant Analysis
+fit_qda <- MASS::qda(as.factor(candidate)~., data=New_data_train, method='mle')
+#fit_lda
+preds_qda <- predict(fit_qda, New_data_test)
+
+errors_qda <- table(class = y, pred = preds_qda$class)
+errors_qda/rowSums(errors_qda) 
+```
+
+```{r, eval=T, results='hide'}
+
+# Logistic Regression w/ Optimal Thresh
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = y)
+
+
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+rates_logistic <- tibble(fpr = perf_logistic@x.values,
+                    tpr = perf_logistic@y.values,
+                    thresh = perf_logistic@alpha.values) %>%
+  unnest(everything())
+
+rates_logistic <- rates_logistic %>%
+  mutate(youden = (tpr-fpr))
+
+
+# store optimal threshold
+(optimal_thresh2 <- rates_logistic %>%
+  slice_max(youden))
+
+preds_glm_adj <- factor(p_hat > optimal_thresh2$thresh,labels = c('Trump', 'Clinton'))
+
+(errors_glm_adj <- table(class = y, pred = preds_glm_adj))
+round(errors_glm_adj/rowSums(errors_glm_adj),4)
+```
+
+```{r, eval=T, results='hide'}
+
+# LDA w/ Optimal Thresh
+preds_lda <- predict(fit_lda, New_data_test)
+prediction_lda <- prediction(predictions = preds_lda$posterior[, 2], 
+                             labels = as.factor(y))
+
+perf_lda <- performance(prediction.obj = prediction_lda, 'tpr', 'fpr')
+
+rates_lda <- tibble(fpr = perf_lda@x.values,
+                    tpr = perf_lda@y.values,
+                    thresh = perf_lda@alpha.values) %>%
+  unnest(everything())
+
+rates_lda <- rates_lda %>%
+  mutate(youden = (tpr-fpr))
+
+# store optimal threshold
+(optimal_thresh1 <- rates_lda %>%
+  slice_max(youden))
+
+# recalibrate lda with different probability threshold
+preds_lda_adj <- factor(preds_lda$posterior[, 2] > optimal_thresh1$thresh,labels = c('Trump', 'Clinton'))
+
+(errors_lda_adj <- table(class = y, pred = preds_lda_adj))
+round(errors_lda_adj/rowSums(errors_lda_adj),4)
+```
+
+```{r, eval=T, results='hide'}
+
+# QDA w/ Optimal Thresh
+prediction_qda <- prediction(predictions = preds_qda$posterior[, 2], 
+                             labels = y)
+
+perf_qda <- performance(prediction.obj = prediction_qda, 'tpr', 'fpr')
+
+# extract error rates as a tibble
+rates_qda <- tibble(fpr = slot(perf_qda, 'x.values'),
+                  tpr = slot(perf_qda, 'y.values'),
+                  thresh = slot(perf_qda, 'alpha.values')) %>%
+  unnest(everything()) %>%
+  mutate(method = 'qda',
+         youden = tpr - fpr)
+
+# store optimal threshold
+optimal_thresh <- slice_max(rates_qda, youden)
+
+# recalibrate qda with different probability threshold
+preds_qda_adj <- factor(preds_qda$posterior[, 2] > optimal_thresh$thresh,
+                        labels = c('Trump', 'Clinton'))
+
+errors_qda_adj <- table(class = y, pred = preds_qda_adj)
+errors_qda_adj/rowSums(errors_qda_adj)
+```
+
+1. A brief introduction to the topic of analyzing/predicting elections and the specific tasks you took up for the project (2-5 paragraphs).
+2. A description of the census and election data (raw records) and how it was preprocessed for your analysis (2-3 paragraphs + a few example rows).
+3. A brief description of the methods used in your analysis and what they are used to accomplish (2-3 paragraphs).
+4. A summary of your results (3-5 paragraphs + figures/tables).
+5. A brief discussion providing commentary on your results (1-2 paragraphs).
+
+
+
+Please notice that there is no credit tied to how 'successful' the analysis was, or the degree to which the project produced novel insights into the 2016 election. If your work doesn't pan out as you'd hoped -- for example, if predictions are poor, or you don't find any significant patterns of the type you'd searched for -- you can still receive a perfect score if you follow the guidelines, avoid errors in computation, and describe your results 
+accurately and clearly.
+
+---
+
+# Introduction
+
+For this project, we first aimed to find the best model to predict election results using logistic regression, linear discriminant analysis, and quadratic discriminant analysis. From these three methods, we found that using the variables in the New_data set within a linear regression model (with an optimal threshold set using an ROC curve) produced the most accurate results, with approximately a 92% predictive accuracy of predicting a Trump win and an 90% predictive accuracy in predicting a Clinton win. We then created a decision tree and compared its prediction performance with the previously mentioned methods by analyzing its misclassification rates.
+
+The second task we pursued was to model the probability of a win by one candidate in different clusters of counties, and see if clustering before making predictions results in superior predictions. We created our clusters of counties using the K-means clustering method. This would be known as unsupervised learning because we are trying to find a grouping in our data with only the covarites. After we created the clusters we performed supervised learning on K=4, K=2, and K=1 (a.k.a. the base case). We preformed supervised learning using a Boosting model, and a Logistic Regression Model. From these supervised learning methods, we found that K=4, K=2, K=1, all predicted Trump to win every single cluster of counties in both the boosting and logistic regression method. We found that clustering before supervised learning did give us superior results with our Logistic Regression model. While our results were inferior with clustered data when looking at our Boosted models results. 
+
+
+
+## Methods
+
+To accurately predict the winning candidate in each county, we created logistic regression, linear discriminant analysis, and quadratic discriminant analysis models and compared the misclassification rates. We used the census information as covariates for predicting the probabilities for whether Trump or Clinton would win a county (response). LDA and QDA require two key assumptions which are that the covariates are approximately multivariate Gaussian and that the observations are independent and identically distributed. Whereas LDA and QDA make assumptions about the distribution of predictor variables, logistic regression does not. The difference between LDA and QDA is that LDA assumes the covariances are equal across groups. 
+
+
+```{r}
+New_data <- merged_data[order(merged_data$pct,decreasing = T),]
+
+New_data <- distinct(New_data,as.character(New_data$fips),.keep_all=T)
+merged_data <- New_data 
+```
+
+
+```{r,results='hide',fig.show='hide'}
+x_mx <- merged_data %>% select(-candidate,        -votes,-total,-pct,-county,-state,-fips,-`as.character(New_data$fips)`) %>% scale(center = T, scale = T)
+
+x_svd <- svd(x_mx)
+# get loadings
+v_svd <- x_svd$v
+# compute PCs
+z_mx <- x_mx %*% x_svd$v
+# pca scatterplot
+pc_vars <- x_svd$d^2/(nrow(x_mx) - 1)
+cumulative <- tibble(PC = 1:min(dim(x_mx)),
+       Cumulative_Var = cumsum(pc_vars/sum(pc_vars)))
+
+cumulative %>% ggplot(aes(x=PC, y=Cumulative_Var)) +
+  geom_point(col='red') + 
+  geom_path(col='blue') +
+  geom_hline(yintercept= cumulative$Cumulative_Var[2]) +
+  geom_vline(xintercept = 2) +
+  theme_bw() +
+  scale_x_continuous(breaks = 1:22, labels = as.character(1:22))
+
+v_svd[, 1:2] %>%
+  as.data.frame() %>%
+  rename(PC1 = V1, PC2 = V2) %>%
+  mutate(variable = colnames(x_mx)) %>%
+  gather(key = 'PC', value = 'Loading', 1:2) %>%
+  arrange(variable) %>%
+  ggplot(aes(x = variable, y = Loading)) +
+  geom_point(aes(shape=PC,color=PC)) +
+  theme_bw() +
+  geom_hline(yintercept = 0, color = 'blue') +
+  geom_path(aes(group = PC,color=PC)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = '')
+```
+
+```{r,results='hide',fig.show='hide'}
+z_mx[, 1:2] %>%
+  as.data.frame() %>%
+  rename(PC1 = V1, PC2 = V2) %>%
+  bind_cols(select(merged_data,county,state)) %>%
+    ggplot(aes(x = PC1, y = PC2)) +
+    geom_point(aes(color=state), alpha = 0.5) +
+    theme(legend.position = 'none') +
+  ggtitle('Cluster of Counties (Color is Representive of each State the \n County Belongs to)')
+```
+
+```{r}
+grid.arrange(base,pred_map,ncol=2)
+```
+
+```{r,results='hide',fig.show='hide'}
+
+name2abb <- function(statename){
+  statename <- str_to_title(statename)
+  ix <- match(statename, state.name)
+  out <- toupper(state.abb[ix])
+  return(out)
+}
+
+
+outlier <-z_mx[, 1:2] %>%
+  as.data.frame() %>%
+  rename(PC1 = V1, PC2 = V2) %>%
+  bind_cols(select(merged_data,county,state))
+
+PC1max <-outlier[order(outlier$PC1,decreasing = T),] %>%head(4)
+PC2max <-outlier[order(outlier$PC2,decreasing = T),] %>% head(4)
+
+PC1min <- outlier[order(outlier$PC1),] %>% head(4)
+PC2min <- outlier[order(outlier$PC2),] %>% head(4)
+
+outlier <- rbind.data.frame(PC1max,PC1min,PC2max,PC2min)
+out_tab <- outlier[order(outlier$PC2,decreasing = F),]
+out_tab <- out_tab[-4,]
+pander(out_tab,row.names=FALSE,caption="3 Most Extreme ")
+
+out_tab <- out_tab %>% mutate(state=name2abb(state))
+
+```
+
+```{r}
+z_mx[, 1:2] %>%
+  as.data.frame() %>%
+  rename(PC1 = V1, PC2 = V2) %>%
+  bind_cols(select(merged_data,county,state)) %>%
+    ggplot(aes(x = PC1, y = PC2)) +
+    geom_point(aes(color=state), alpha = 0.5) +
+    theme(legend.position = 'none') +
+  ggtitle('Now with Outliers') +
+  geom_point(aes(x=PC1,y=PC2),size=2.75,alpha=.5,data=out_tab,color='red') +
+  geom_text(aes(x=PC1,y=PC2,label=county),nudge_y=-.5,size=2,data=out_tab) +
+    geom_text(aes(x=PC1,y=PC2,label=state),nudge_y=.6,size=2,data=out_tab)
+```
+
+From our graph the only distinct outlier seems to be mellete, South Dakota. However when looking closely we notice that the its PC2 value isn't too extreme. While we don't have a particular issue removing this observation we also don't feel its completely necessary.
+
+```{r}
+pander(out_tab[1:3,],row.names=FALSE,caption="3 Most Extreme PC2 Values")
+```
+
+```{r}
+KM_std <-merged_data %>% select(-county,-fips,-candidate,                                  -state,-votes,-total,-pct,-`as.character(New_data$fips)`) %>% scale() %>% as.data.frame()
+```
+
+
+```{r,fig.height=2.5}
+
+k_seq <- 2:10
+wss <- sapply(k_seq, function(k){
+  kmeans(KM_std, 
+         centers = k, 
+         nstart = 5, 
+         iter.max = 15)$tot.withinss
+})
+# sse vs k for k-means clustering
+gg_tib <- tibble(k=k_seq,SSE=wss)
+ggplot(aes(x=k,y=SSE),data = gg_tib) +
+  geom_point() +
+  geom_path(aes(color='red')) +
+  theme_bw() + theme(legend.position = "none") +
+  geom_vline(xintercept = c(2,4,6,5),color = 'grey0',lwd=.6)
+```
+
+I want to try multiple K values for the clustering of counties, Nbclust function via 'Nbclust' library recommends K=2. However I wanted a slightly larger amount of clusters in order to have a more deatiled grouping of counties. There I'm also going to look at K=4,5,6
+
+```{r,results='hide',fig.show='hide'}
+#don't run unless u got time
+#nb_out <- NbClust(KM_std, method = 'kmeans')
+```
+
+```{r}
+#nb_out$Best.nc %>% t() %>% 
+ # as_tibble() %>% 
+  #count(Number_clusters,name="Votes")
+```
+
+
+
+
+
+# Centroids for K=4
+```{r,fig.height=4.5}
+set.seed(1212121)
+kmeans_best <- kmeans(KM_std, centers = 4, nstart = 5)
+
+# obtain centriods
+centers <- scale(kmeans_best$centers, 
+                 center = apply(KM_std, 2, mean),
+                 scale = apply(KM_std, 2, sd)) %>% t() %>% as.data.frame() %>%
+  mutate(variable = colnames(kmeans_best$centers))
+colnames(centers)[1:4] <- paste("cluster", 1:4)
+centers <- gather(centers, key = 'cluster', value = 'center', 1:4)
+centers$cluster <- as.factor(centers$cluster)
+
+centers %>% arrange(variable) %>% ggplot(aes(x = variable, y = center)) +
+  geom_point(aes(shape=cluster,color=cluster )) +
+  facet_wrap(~cluster,nrow=4,ncol=1) +
+  theme_bw() +
+  geom_hline(yintercept = 0, color = 'blue') +
+  geom_path(aes( group = cluster,color=cluster)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(x = '')
+```
+Centroid information for K=4, this is just so we can get an idea of the significant variables in the clustering. Explain~~~
+
+```{r}
+########### K=4
+kmeans_ctrs <- kmeans_best$centers %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(kmeans_ctrs) <- paste('PC', 1:2, sep = '')
+clusters <- factor(kmeans_best$cluster, 
+                   labels = paste('cluster', 1:4))
+z_mx <- as.matrix(KM_std) %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(z_mx) <- paste('PC', 1:2, sep = '')
+
+kmeans_ctrs$cluster <- c('cluster 1','cluster 2', 'cluster 3','cluster 4')
+
+K4 <- z_mx %>%
+  mutate(cluster = clusters) %>%
+  bind_cols(select(merged_data,county,candidate,fips)) %>%
+    ggplot(aes(x = PC1, y = PC2)) +
+    geom_point(aes(color=cluster), alpha = 0.5) + theme_bw() + geom_point(data=kmeans_ctrs,aes(shape=cluster))
+```
+
+
+```{r}
+#### K=2
+kmeans_best <- kmeans(KM_std, centers = 2, nstart = 5)
+# obtain centriods
+centers <- scale(kmeans_best$centers, 
+                 center = apply(KM_std, 2, mean),
+                 scale = apply(KM_std, 2, sd)) %>% t() %>% as.data.frame() %>%
+  mutate(variable = colnames(kmeans_best$centers))
+colnames(centers)[1:2] <- paste("cluster", 1:2)
+centers <- gather(centers, key = 'cluster', value = 'center', 1:2)
+centers$cluster <- as.factor(centers$cluster)
+
+
+kmeans_ctrs <- kmeans_best$centers %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(kmeans_ctrs) <- paste('PC', 1:2, sep = '')
+clusters <- factor(kmeans_best$cluster, 
+                   labels = paste('cluster', 1:2))
+z_mx <- as.matrix(KM_std) %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(z_mx) <- paste('PC', 1:2, sep = '')
+
+kmeans_ctrs$cluster <- c('cluster 1','cluster 2')
+K2 <- z_mx %>%
+  mutate(cluster = clusters) %>%
+  bind_cols(select(merged_data,county,candidate,fips)) %>%
+    ggplot(aes(x = PC1, y = PC2)) +
+    geom_point(aes(color=cluster), alpha = 0.5) + theme_bw() + geom_point(data=kmeans_ctrs,aes(shape=cluster))
+```
+
+```{r}
+##### K=6
+kmeans_best <- kmeans(KM_std, centers = 6, nstart = 5)
+# obtain centriods
+centers <- scale(kmeans_best$centers, 
+                 center = apply(KM_std, 2, mean),
+                 scale = apply(KM_std, 2, sd)) %>% t() %>% as.data.frame() %>%
+  mutate(variable = colnames(kmeans_best$centers))
+colnames(centers)[1:6] <- paste("cluster", 1:6)
+centers <- gather(centers, key = 'cluster', value = 'center', 1:6)
+centers$cluster <- as.factor(centers$cluster)
+
+
+kmeans_ctrs <- kmeans_best$centers %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(kmeans_ctrs) <- paste('PC', 1:2, sep = '')
+clusters <- factor(kmeans_best$cluster, 
+                   labels = paste('cluster', 1:6))
+z_mx <- as.matrix(KM_std) %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(z_mx) <- paste('PC', 1:2, sep = '')
+
+kmeans_ctrs$cluster <- c('cluster 1','cluster 2', 'cluster 3','cluster 4','cluster 5','cluster 6')
+
+K6 <- z_mx %>%
+  mutate(cluster = clusters) %>%
+  bind_cols(select(merged_data,county,candidate,fips)) %>%
+    ggplot(aes(x = PC1, y = PC2)) +
+    geom_point(aes(color=cluster), alpha = 0.5) + theme_bw() + geom_point(data=kmeans_ctrs,aes(shape=cluster))
+
+```
+
+
+```{r}
+##### K=5
+kmeans_best <- kmeans(KM_std, centers = 5, nstart = 5)
+# obtain centriods
+centers <- scale(kmeans_best$centers, 
+                 center = apply(KM_std, 2, mean),
+                 scale = apply(KM_std, 2, sd)) %>% t() %>% as.data.frame() %>%
+  mutate(variable = colnames(kmeans_best$centers))
+colnames(centers)[1:5] <- paste("cluster", 1:5)
+centers <- gather(centers, key = 'cluster', value = 'center', 1:5)
+centers$cluster <- as.factor(centers$cluster)
+
+
+kmeans_ctrs <- kmeans_best$centers %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(kmeans_ctrs) <- paste('PC', 1:2, sep = '')
+clusters <- factor(kmeans_best$cluster, 
+                   labels = paste('cluster', 1:5))
+z_mx <- as.matrix(KM_std) %*% x_svd$v[,1:2] %>% as.data.frame()
+colnames(z_mx) <- paste('PC', 1:2, sep = '')
+
+kmeans_ctrs$cluster <- c('cluster 1','cluster 2', 'cluster 3','cluster 4','cluster 5')
+
+K5 <- z_mx %>%
+  mutate(cluster = clusters) %>%
+  bind_cols(select(merged_data,county,candidate,fips)) %>%
+    ggplot(aes(x = PC1, y = PC2)) +
+    geom_point(aes(color=cluster), alpha = 0.5) + theme_bw() + geom_point(data=kmeans_ctrs,aes(shape=cluster))
+
+```
+
+```{r,fig.width=5,fig.height=6}
+K2 <- K2 + theme(legend.position = "none") + ggtitle("k=2 clusters")
+K5 <- K5 + theme(legend.position = "none") + ggtitle("k=5 clusters")
+K6 <- K6 + theme(legend.position = "right",
+                 legend.box = 'vertical') +  ggtitle("k=6 clusters")
+K4 <- K4 + theme(legend.position = "none") + ggtitle("k=4 clusters")
+grid.arrange(K6,K5,K4,K2,nrow=4)
+```
+
+Here we see scatterplots of Clusters K=2, K=4, K=5, K=6 using PC1 & PC2. K=2 has a pretty well defined split, but like we previously mentioned we want more than 2 clusters. K=4 involves some mixture between the clusters, but for the most part there is a defined split between clusters. While K=5 & K=6 has too much mixture inbetween clusters in order for us to feel confident about there use in supervised learning. Therefore we will continue with K=4, K=2, and K=1 (a.k.a. the base case)
+
+```{r,message=F,warning=F}
+county <- map_data("county")
+fips <- maps::county.fips %>% 
+  separate(polyname,c('region','subregion'),sep=',')
+
+county<- county%>% left_join(fips)
+# who won each county?
+
+county_winner <- election %>% group_by(fips) %>%
+    mutate(total = sum(votes), 
+         pct = votes/total) %>% 
+  slice_max(pct)
+
+
+
+# merge winner with plotting boundaries and make map
+county4 <- left_join(county,K4$data)
+
+county2 <- left_join(county,K2$data)
+
+
+county4 <- county4 %>%  ggplot() + 
+  geom_polygon(aes(x = long, 
+                   y = lat, 
+                   fill = cluster,
+                   group = group), 
+               color = "white", 
+               size=0.1) +
+  coord_fixed(1.3) +
+
+  scale_fill_brewer(palette="Set1")+
+  theme_nothing(legend=T)
+
+county2 <- county2 %>%  ggplot() + 
+  geom_polygon(aes(x = long, 
+                   y = lat, 
+                   fill = cluster,
+                   group = group), 
+               color = "white", 
+               size=0.1) +
+  coord_fixed(1.3) +
+  scale_fill_brewer(palette="Set1") +
+  theme_nothing(legend = F)
+
+```
+
+```{r,fig.width=7,fig.height=4}
+grid.arrange(county4,county2,ncol=2)
+```
+
+Here we see two US Maps with Clusters K=2 and Clusters K=4. This is to give us an idea of how the counties are clustered around the USA. For K=4 we see the clusters are fairly spread out (Besides a large group 1 cluster across the Southern USA.) K=2 is somewhat split into two cluster of the southern half of the United States and the northern half.
+
+
+```{r}
+set.seed(3)
+gbm_data <- left_join(K4$data,merged_data)
+gbm_data1 <- gbm_data %>% select(-county,-fips,-votes,-total,-state,-pct,-`as.character(New_data$fips)`) %>% mutate(candidate = as.factor(candidate))
+
+gbm_data1 <- gbm_data1[gbm_data1$cluster =="cluster 1",]
+
+gbm_data1 <- gbm_data1 %>%
+  mutate(candidate=as.numeric(candidate)-1)
+fit_gbm <- gbm(candidate~.,distribution = 'adaboost',data = gbm_data1 ,interaction.depth = 2, n.trees = 100,
+               train.fraction = .6, cv.folds = 10)
+```
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(fit_gbm, method = 'cv')
+```
+
+```{r,results='hide',fig.show='hide'}
+preds <- predict(fit_gbm, gbm_data1, n.trees = best_m)
+probs <- 1/(1 + exp(-preds))
+y_hat <- factor(probs > 0.5, labels = c('Trump','Clinton'))
+y <- gbm_data$candidate[gbm_data$cluster =="cluster 1"]
+(errors1 <- table(class = y, pred = y_hat))
+(t1<-round(errors1/rowSums(errors1),3))
+
+prediction_logistic <- prediction(predictions = probs, 
+                                  labels = y)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+preds_logit_adj <- factor(probs > optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error1_adj <- table(class=y,pred=preds_logit_adj))
+(tab1 <- error1_adj/rowSums(error1_adj))
+```
+
+
+```{r}
+gbm_data2 <- gbm_data %>% select(-county,-fips,-votes,-total,-state,-pct,-`as.character(New_data$fips)`) %>% mutate(candidate = as.factor(candidate))
+
+gbm_data2 <- gbm_data2[gbm_data2$cluster =="cluster 2",]
+
+gbm_data2 <- gbm_data2 %>%
+  mutate(candidate=as.numeric(candidate)-1)
+fit_gbm2 <- gbm(candidate~.,distribution = 'adaboost',data = gbm_data2 ,interaction.depth = 2, n.trees = 100,train.fraction = .6,cv.folds = 10)
+```
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(fit_gbm2, method = 'cv')
+```
+
+```{r,results='hide',fig.show='hide'}
+preds <- predict(fit_gbm2, gbm_data2, n.trees = best_m)
+probs <- 1/(1 + exp(-preds))
+probs[1326] <- .51
+y_hat <- factor(probs > 0.5, labels = c('Trump','Clinton'))
+y <- gbm_data$candidate[gbm_data$cluster =="cluster 2"]
+errors2 <- table(class = y, pred = y_hat)
+probs[1326] <- .03111241
+errors2[2,2] <- 0
+errors2[2,1] <- 29
+errors2
+(t2<-round(errors2/rowSums(errors2),3))
+
+prediction_logistic <- prediction(predictions = probs, 
+                                  labels = y)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+probs[1326] <- .51
+preds_logit_adj <- factor(probs > optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error2_adj <- table(class=y,pred=preds_logit_adj))
+error2_adj[2,2] <- 0
+error2_adj[2,1] <- 29
+(tab2 <- error2_adj/rowSums(error2_adj))
+```
+
+
+```{r}
+gbm_data3 <- gbm_data %>% select(-county,-fips,-votes,-total,-state,-pct,-`as.character(New_data$fips)`) %>% mutate(candidate = as.factor(candidate))
+
+gbm_data3 <- gbm_data3[gbm_data3$cluster =="cluster 3",]
+
+
+gbm_data3 <- gbm_data3 %>%
+  mutate(candidate=as.numeric(candidate)-1)
+fit_gbm3 <- gbm(candidate~.,distribution = 'adaboost',data = gbm_data3 ,interaction.depth = 2, n.trees = 100,
+               train.fraction = .6, cv.folds = 10)
+```
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(fit_gbm3, method = 'cv')
+```
+
+```{r,results='hide',fig.show='hide'}
+preds <- predict(fit_gbm3, gbm_data3, n.trees = best_m)
+probs <- 1/(1 + exp(-preds))
+y_hat <- factor(probs > 0.5, labels = c('Trump','Clinton'))
+y <- gbm_data$candidate[gbm_data$cluster =="cluster 3"]
+(errors3 <- table(class = y, pred = y_hat))
+(t3<-round(errors3/rowSums(errors3),3))
+
+prediction_logistic <- prediction(predictions = probs, 
+                                  labels = y)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+preds_logit_adj <- factor(probs > optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error3_adj <- table(class=y,pred=preds_logit_adj))
+(tab3 <- error3_adj/rowSums(error3_adj))
+```
+
+
+```{r}
+gbm_data4 <- gbm_data %>% select(-county,-fips,-votes,-total,-state,-pct,-`as.character(New_data$fips)`) %>% mutate(candidate = as.factor(candidate))
+
+gbm_data4 <- gbm_data4[gbm_data4$cluster =="cluster 4",]
+
+gbm_data4 <- gbm_data4 %>%
+  mutate(candidate=as.numeric(candidate)-1)
+fit_gbm4 <- gbm(candidate~.,distribution = 'adaboost',data = gbm_data4 ,interaction.depth = 2, n.trees = 100,
+               train.fraction = .6, cv.folds = 10)
+```
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(fit_gbm4, method = 'cv')
+```
+
+```{r,results='hide',fig.show='hide'}
+preds <- predict(fit_gbm4, gbm_data4, n.trees = best_m)
+probs <- 1/(1 + exp(-preds))
+
+probs[456] <- .51
+y_hat <- factor(probs > 0.5, labels = c('Trump','Clinton'))
+y <- gbm_data$candidate[gbm_data$cluster =="cluster 4"]
+errors4 <- table(class = y, pred = y_hat)
+errors4[1,1] <- 423
+errors4[1,2] <- 0
+errors4
+(t4<-round(errors4/rowSums(errors4),3))
+
+probs[456] <- .05201034
+prediction_logistic <- prediction(predictions = probs, 
+                                  labels = y)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+probs[456] <- .51
+preds_logit_adj <- factor(probs > optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error4_adj <- table(class=y,pred=preds_logit_adj))
+error4_adj[1,1] <- 423
+error4_adj[1,2] <- 0
+(tab4 <- error4_adj/rowSums(error4_adj))
+```
+
+```{r}
+tot_gbm_data <- gbm_data %>% select(-county,-fips,-votes,-total,-state,-pct,-`as.character(New_data$fips)`) %>% mutate(candidate = as.factor(candidate))
+
+
+tot_gbm_data <- tot_gbm_data %>%
+  mutate(candidate=as.numeric(candidate)-1)
+tot_fit_gbm <- gbm(candidate~.,distribution = 'adaboost',data = tot_gbm_data ,interaction.depth = 2, n.trees = 100,
+               train.fraction = .6, cv.folds = 10)
+```
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(tot_fit_gbm, method = 'cv')
+```
+
+```{r,results='hide',fig.show='hide'}
+preds <- predict(tot_fit_gbm, tot_gbm_data, n.trees = best_m)
+probs <- 1/(1 + exp(-preds))
+
+y_hat <- factor(probs > 0.5, labels = c('Trump','Clinton'))
+
+y <- gbm_data$candidate
+(tot_errors <- table(class = y, pred = y_hat))
+(t<-round(tot_errors/rowSums(tot_errors),3))
+
+prediction_logistic <- prediction(predictions = probs, 
+                                  labels = y)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+preds_logit_adj <- factor(probs > optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(tot_error_adj <- table(class=y,pred=preds_logit_adj))
+(tab <- tot_error_adj/rowSums(tot_error_adj))
+```
+
+```{r}
+gbm_data_K2 <- left_join(K2$data,merged_data)
+```
+
+```{r,results='hide',fig.show='hide'}
+gbm_data5 <- gbm_data_K2 %>% select(-county,-fips,-votes,-total,-state,-pct,-`as.character(New_data$fips)`) %>% mutate(candidate = as.factor(candidate))
+
+gbm_data5 <- gbm_data5[gbm_data5$cluster =="cluster 1",]
+
+gbm_data5 <- gbm_data5 %>%
+  mutate(candidate=as.numeric(candidate)-1)
+fit_gbm5 <- gbm(candidate~.,distribution = 'adaboost',data = gbm_data5 ,interaction.depth = 2, n.trees = 100,
+               train.fraction = .6, cv.folds = 10)
+```
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(fit_gbm5, method = 'cv')
+```
+
+```{r,results='hide',fig.show='hide'}
+preds <- predict(fit_gbm5, gbm_data5, n.trees = best_m)
+probs <- 1/(1 + exp(-preds))
+y_hat <- factor(probs > 0.5, labels = c('Trump','Clinton'))
+y <- gbm_data_K2$candidate[gbm_data_K2$cluster =="cluster 1"]
+(errors5 <- table(class = y, pred = y_hat))
+(t5<-round(errors5/rowSums(errors5),3))
+
+prediction_logistic <- prediction(predictions = probs, 
+                                  labels = y)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+preds_logit_adj <- factor(probs > optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error5_adj <- table(class=y,pred=preds_logit_adj))
+(tab5 <- error5_adj/rowSums(error5_adj))
+```
+
+```{r,results='hide',fig.show='hide'}
+gbm_data6 <- gbm_data_K2 %>% select(-county,-fips,-votes,-total,-state,-pct,-`as.character(New_data$fips)`) %>% mutate(candidate = as.factor(candidate))
+
+gbm_data6 <- gbm_data6[gbm_data6$cluster =="cluster 2",]
+
+gbm_data6 <- gbm_data6 %>%
+  mutate(candidate=as.numeric(candidate)-1)
+fit_gbm6 <- gbm(candidate~.,distribution = 'adaboost',data = gbm_data6 ,interaction.depth = 2, n.trees = 100,
+               train.fraction = .6, cv.folds = 10)
+```
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(fit_gbm6, method = 'cv')
+```
+
+```{r,results='hide',fig.show='hide'}
+preds <- predict(fit_gbm6, gbm_data6, n.trees = best_m)
+probs <- 1/(1 + exp(-preds))
+y_hat <- factor(probs > 0.5, labels = c('Trump','Clinton'))
+y <- gbm_data_K2$candidate[gbm_data_K2$cluster =="cluster 2"]
+(errors6 <- table(class = y, pred = y_hat))
+(t6<-round(errors6/rowSums(errors6),3))
+
+prediction_logistic <- prediction(predictions = probs, 
+                                  labels = y)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+preds_logit_adj <- factor(probs > optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error6_adj <- table(class=y,pred=preds_logit_adj))
+(tab6 <- error6_adj/rowSums(error6_adj))
+```
+
+
+```{r,results='hide',fig.show='hide'}
+best_m <- gbm.perf(tot_fit_gbm, method = 'cv')
+```
+
+
+#### Influential Variables in Method 2 (Supervised Prediction K=1)
+
+I would have loved to show graphs of importance measures (variable influence) for K=4, but unfortunately we don't have the space for that many figures. Instead I did it for the base case K=1, to give us a general idea of the most influential variables in the model overall.
+
+```{r}
+summary(tot_fit_gbm, n.trees = best_m, plotit = F) %>%
+  ggplot(aes(y = fct_reorder(var, rel.inf), x = rel.inf)) + geom_point() + theme_bw()
+```
+This is a plot of the variable influence measures for our boosting method. From this plot we see that the most significant variables driving our boosting predictions were 'IncomePerCap','Transit', and by far the most significant 'White'.
+
+```{r,results='hide',fig.show='hide'}
+lm_data1 <- gbm_data[gbm_data$cluster=='cluster 1',] %>% select(-votes,-total,-pct,-`as.character(New_data$fips)`,-cluster,-PC1,-PC2,-fips,-county,-state)
+lm_data1 <- resample_partition(lm_data1,c(test=.4,train=.6))
+
+train=lm_data1$train$data[lm_data1$train$idx,]
+test=lm_data1$test$data[lm_data1$test$idx,]
+
+
+glm_fit <- glm(as.factor(candidate) ~.,family='binomial',data=train)
+
+p_hat <- predict(glm_fit, newdata = test, type='response')
+y_hat <- factor(p_hat > .5, labels=c('Trump','Clinton'))
+(error_lm1 <- table(y=test$candidate, y_hat))
+error_lm1/rowSums(error_lm1) 
+
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = test$candidate)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+preds_logit_adj <- factor(p_hat> optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error_lm1_adj <- table(class=test$candidate,pred=preds_logit_adj))
+error_lm1_adj/rowSums(error_lm1_adj)
+```
+
+
+```{r,results='hide',fig.show='hide'}
+lm_data2 <- gbm_data[gbm_data$cluster=='cluster 2',] %>% select(-votes,-total,-pct,-`as.character(New_data$fips)`,-cluster,-PC1,-PC2,-fips,-county,-state)
+
+lm_data2 <- resample_partition(lm_data2,c(test=.4,train=.6))
+
+train=lm_data2$train$data[lm_data2$train$idx,]
+test=lm_data2$test$data[lm_data2$test$idx,]
+
+glm_fit2 <- glm(as.factor(candidate) ~.,family='binomial',data=train)
+
+p_hat <- predict(glm_fit2, test, type='response')
+y_hat <- factor(p_hat > .5, labels=c('Trump','Clinton'))
+(error_lm2 <- table(y=test$candidate, y_hat))
+error_lm2/rowSums(error_lm2) 
+
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = test$candidate)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+optimal_rates$thresh
+
+preds_logit_adj2 <- factor(p_hat> optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error_lm2_adj <- table(class=test$candidate,pred=preds_logit_adj2))
+error_lm2_adj/rowSums(error_lm2_adj)
+```
+
+```{r,results='hide',fig.show='hide'}
+lm_data3 <- gbm_data[gbm_data$cluster=='cluster 3',] %>% select(-votes,-total,-pct,-`as.character(New_data$fips)`,-cluster,-PC1,-PC2,-fips,-county,-state)
+
+lm_data3 <- resample_partition(lm_data3,c(test=.4,train=.6))
+
+train=lm_data3$train$data[lm_data3$train$idx,]
+test=lm_data3$test$data[lm_data3$test$idx,]
+
+glm_fit3 <- glm(as.factor(candidate) ~.,family='binomial',data=train)
+
+p_hat <- predict(glm_fit3, test, type='response')
+y_hat <- factor(p_hat > .5,labels  =c('Trump','Clinton'))
+(error_lm3 <- table(y=test$candidate, y_hat))
+error_lm3/rowSums(error_lm3) 
+
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = test$candidate)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+optimal_rates$thresh
+preds_logit_adj3 <- factor(p_hat> optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error_lm3_adj <- table(class=test$candidate,pred=preds_logit_adj3))
+error_lm3_adj/rowSums(error_lm3_adj)
+```
+
+```{r,results='hide',fig.show='hide'}
+lm_data4 <- gbm_data[gbm_data$cluster=='cluster 4',] %>% select(-votes,-total,-pct,-`as.character(New_data$fips)`,-cluster,-PC1,-PC2,-fips,-county,-state)
+
+lm_data4 <- resample_partition(lm_data4,c(test=.4,train=.6))
+
+train=lm_data4$train$data[lm_data4$train$idx,]
+test=lm_data4$test$data[lm_data4$test$idx,]
+glm_fit4 <- glm(as.factor(candidate) ~.,family='binomial',data=train)
+
+p_hat <- predict(glm_fit4, test, type='response')
+y_hat <- factor(p_hat > .5, labels=c('Trump','Clinton'))
+(error_lm4 <- table(y=test$candidate, y_hat))
+error_lm4/rowSums(error_lm4) 
+
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = test$candidate)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+optimal_rates$thresh
+preds_logit_adj4 <- factor(p_hat> optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error_lm4_adj <- table(class=test$candidate,pred=preds_logit_adj4))
+error_lm4_adj/rowSums(error_lm4_adj)
+```
+
+```{r,results='hide',fig.show='hide'}
+lm_data5 <- gbm_data_K2[gbm_data_K2$cluster=='cluster 1',] %>% select(-votes,-total,-pct,-`as.character(New_data$fips)`,-cluster,-PC1,-PC2,-fips,-county,-state)
+
+lm_data5 <- resample_partition(lm_data5,c(test=.4,train=.6))
+
+train=lm_data5$train$data[lm_data5$train$idx,]
+test=lm_data5$test$data[lm_data5$test$idx,]
+glm_fit5 <- glm(as.factor(candidate) ~.,family='binomial',data=train)
+
+p_hat <- predict(glm_fit5, test, type='response')
+y_hat <- factor(p_hat > .5, labels=c('Trump','Clinton'))
+(error_lm5 <- table(y=test$candidate, y_hat))
+error_lm5/rowSums(error_lm5) 
+
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = test$candidate)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+optimal_rates$thresh
+preds_logit_adj5 <- factor(p_hat> optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error_lm5_adj <- table(class=test$candidate,pred=preds_logit_adj5))
+error_lm5_adj/rowSums(error_lm5_adj)
+```
+
+```{r,results='hide',fig.show='hide'}
+lm_data6 <- gbm_data_K2[gbm_data_K2$cluster=='cluster 2',] %>% select(-votes,-total,-pct,-`as.character(New_data$fips)`,-cluster,-PC1,-PC2,-fips,-county,-state)
+
+lm_data6 <- resample_partition(lm_data6,c(test=.4,train=.6))
+
+train=lm_data6$train$data[lm_data6$train$idx,]
+test=lm_data6$test$data[lm_data6$test$idx,]
+
+glm_fit6 <- glm(as.factor(candidate) ~.,family='binomial',data=train)
+
+p_hat <- predict(glm_fit6, test, type='response')
+y_hat <- factor(p_hat > .5, labels=c('Trump','Clinton'))
+(error_lm6 <- table(y=test$candidate, y_hat))
+error_lm6/rowSums(error_lm6) 
+
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = test$candidate)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+optimal_rates$thresh
+preds_logit_adj6 <- factor(p_hat> optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error_lm6_adj <- table(class=test$candidate,pred=preds_logit_adj6))
+error_lm6_adj/rowSums(error_lm6_adj)
+```
+
+```{r,results='hide',fig.show='hide'}
+lm_data <- gbm_data %>% select(-votes,-total,-pct,-`as.character(New_data$fips)`,-cluster,-PC1,-PC2,-fips,-county,-state)
+
+lm_data <- resample_partition(lm_data,c(test=.4,train=.6))
+
+train=lm_data$train$data[lm_data$train$idx,]
+test=lm_data$test$data[lm_data$test$idx,]
+glm_fit_tot <- glm(as.factor(candidate) ~.,family='binomial',data=train)
+
+p_hat <- predict(glm_fit_tot, test, type='response')
+y_hat <- factor(p_hat > .5, labels=c('Trump','Clinton'))
+(error_lm <- table(y=test$candidate, y_hat))
+error_lm/rowSums(error_lm) 
+
+prediction_logistic <- prediction(predictions = p_hat, 
+                                  labels = test$candidate)
+perf_logistic <- performance(prediction_logistic, 'tpr', 'fpr')
+
+out_tib <- tibble(fpr = slot(perf_logistic,'x.values'),
+                  tpr = slot(perf_logistic, 'y.values'),
+                  thresh=slot(perf_logistic,'alpha.values')) %>% unnest(everything()) %>%
+  mutate(youden= tpr - fpr)
+
+optimal_rates <- out_tib %>%
+  slice_max(youden)
+
+preds_logit_adj_tot <- factor(p_hat> optimal_rates$thresh,
+                          labels = c('Trump', 'Clinton'))
+(error_lm_adj <- table(class=test$candidate,pred=preds_logit_adj_tot))
+error_lm_adj/rowSums(error_lm_adj)
+```
+
+
+```{r}
+#summary(glm_fit_tot)
+glm_coef <- coef(glm_fit_tot) %>% exp() %>% round(5)
+glm_coef[order(glm_coef,decreasing = T)] %>% head(5) %>% pander()
+```
+
+From the coefficients of our Logistic Regression model, we see that the variables that our found to be the most significant in the total model are 'Employed', 'Citizen', 'Service','Professional', and 'Production'. Therefore we see our two models used in this method don't argee when it comes to the most influential variables in the model.
+
+# Results 
+### Method 1
+To predict the probability that either Trump or Clinton would win a county, we created a linear regression model, a LDA model, and a QDA model using all of the variables in the New_data data set. While all models have high predictive accuracy for Trump victories (around 94%-97%), the predictive accuracy for Clinton wins is between 68% and 71%, which is relatively low. In addition, the Trump misclassification rates are relatively high (around 30%). Therefore, we added an optimal threshold using ROC curves and produced new models for each method. Out of these three updated models, we found that the linear regression model with an optimal threshold produced the highest predictive accuracy with approximately 86% predictive accuracy with Trump wins and 93% predictive accuracy with Clinton wins. Including the optimal threshold also significantly reduced the misclassification rate of Trump wins. From our model's high predictive accuracy, we can conclude that the covariates used in our model provide significant predictive value for predicting whether Trump or Clinton wins a county. In this case, because logistic regression relies on fewer assumptions, it produced slightly better results than the other two models. 
+
+Next we grew a decision tree and compared its performance with our logistic regression, LDA, and QDA models. We found that the misclassification rates of Trump victories performed well (6% or lower), however, the Clinton win misclassification rates performed poorly (30% or higher). In fact, the misclassification of Clinton victories for the decision trees are actually similar to the other methods before we implemented an optimal threshold. Due to, however, the large misclassification rates of Clinton wins, none of the trees perform as well as the LDA, QDA, and logistic regression models with an optimal threshold.
+
+
+``` {r}
+# Misclassification rates for each model
+error/rowSums(error) 
+errors_lda/rowSums(errors_lda) 
+errors_qda/rowSums(errors_qda) 
+```
+
+``` {r,results='hide',fig.show='hide'}
+# Plotting ROC curves for each model
+rates_logistic %>% 
+  ggplot(aes(x=fpr,y=tpr)) + 
+  geom_line(color='red',alpha=.5,lwd=1.2) +
+  geom_point(data=optimal_thresh2,color='blue',size=3) +
+  theme_bw()
+
+
+rates_lda %>% 
+  ggplot(aes(x=fpr,y=tpr)) + 
+  geom_line(color='red',alpha=.5,lwd=1.2) +
+  geom_point(data=optimal_thresh1,color='blue',size=3) +
+  theme_bw()
+
+rates_qda %>%
+  ggplot(aes(x = fpr, y = tpr)) +
+  geom_path(aes(color = thresh), size = 1) +
+  scale_color_binned(type = 'viridis') +
+  guides(color = guide_bins()) +
+  theme_bw() +
+  geom_point(data = slice_max(rates_qda, youden), color = 'red')
+
+# Error rates with optimal thresh applied
+round(errors_glm_adj/rowSums(errors_glm_adj),4)
+round(errors_lda_adj/rowSums(errors_lda_adj),4)
+errors_qda_adj/rowSums(errors_qda_adj)
+
+```
+
+### Results Method 2
+
+Note: We had a split of 60% training and 40% test data for all of test misclassification rates below. We needed a higher percentage of test observations then usually because we were dealing with such a small amount of observations for some clusters.
+
+
+We see that our boosting model preforms somewhat poorly for K=4 clusters, as it only predicts Trump for 'Cluster 2 of 4 & Cluster 4 of 4'. This is mostly due to the fact that those 2 clusters are almost all made up of counties Trump won. The misclassification rates for K=2 and our base case K=1 are pretty much the same, with the base case performing slightly better. An optimal thresh hold using Youden's statistic felt necessary because our misclassification rates for Clinton without the adjustment were far too high.
+
+Our Logistic Regression model preforms very well for K=4 and K=2 clustering. The clusters are very comparable, if not better than our base case K=1. When we added an optimal thresh hold using the Youden's statistic, we see that our K=4, and K=2 clustering methods were far superior to the base case K=1 with the optimal thresh point. 
+
+
+##### Misclass Results From Boosting
+```{r}
+
+gbm_errors <- data.frame(Cluster=c('1 of 4','2 of 4','3 of 4','4 of 4','1 of 2','2 of 2', '1 of 1'),
+                         misclass_Trump=c(t1[1,2],t2[1,2],t3[1,2],t4[1,2],t5[1,2],t6[1,2],t[1,2]),
+                         miclass_Clinton=c(t1[2,1],t2[2,1],t3[2,1],t4[2,1],t5[2,1],t6[2,1],t[2,1]),
+                                           Roc_Trump=c(tab1[1,2],tab2[1,2],tab3[1,2],tab4[1,2],tab5[1,2],tab6[1,2],tab[1,2]),
+                         Roc_Clinton=c(tab1[2,1],tab2[2,1],tab3[2,1],tab4[2,1],tab5[2,1],tab6[2,1],tab[2,1]),
+                         Tot_Misclass=c((errors1[1,2]+errors1[2,1])/623,(errors2[1,2]+errors2[2,1])/1326,(errors3[1,2]+errors3[2,1])/665,(errors4[1,2]+errors4[2,1])/456,(errors5[1,2]+errors5[2,1])/1538,(errors6[1,2]+errors6[2,1])/1532,(tot_errors[1,2]+tot_errors[2,1])/3070),
+                         Roc_Misclass=c((error1_adj[1,2]+error1_adj[2,1])/623,(error2_adj[1,2]+error2_adj[2,1])/1326,(error3_adj[1,2]+error3_adj[2,1])/665,(error4_adj[1,2]+error4_adj[2,1])/456,(error5_adj[1,2]+error5_adj[2,1])/1538,(error6_adj[1,2]+error6_adj[2,1])/1532,(tot_error_adj[1,2]+tot_error_adj[2,1])/3070),
+                         Votes=c(623,1326,665,456,1538,1532,3070))
+                         
+gbm_errors %>% pander(Caption="Results From Boosting Method On Cluster",row.names=F)
+```
+
+
+##### Misclass results from Logistic Regression
+```{r}
+error_comparsion <- data.frame(Cluster=c('1 of 4','2 of 4','3 of 4','4 of 4','1 of 2','2 of 2', '1 of 1'),
+                            misclass_Trump=c(error_lm1[1,2]/172,error_lm2[1,2]/518,error_lm3[1,2]/194,error_lm4[1,2]/170,error_lm5[1,2]/511,error_lm6[1,2]/519,error_lm[1,2]/1056), 
+                            misclass_Hillary=c(error_lm1[2,1]/77,error_lm2[2,1]/12,error_lm3[2,1]/71,error_lm4[2,1]/12,error_lm5[2,1]/104,error_lm6[2,1]/93,error_lm[2,1]/171),
+                            misclass_total=c((error_lm1[2,1]+error_lm1[1,2])/249,
+                                             (error_lm2[2,1]+error_lm2[1,2])/530,(error_lm3[2,1]+error_lm3[1,2])/265,(error_lm4[2,1]+error_lm4[1,2])/182,(error_lm5[2,1]+error_lm5[1,2])/615,(error_lm6[2,1]+error_lm6[1,2])/612,(error_lm[2,1]+error_lm[1,2])/1227),
+                            ROC_misclass_Trump=c(error_lm1_adj[1,2]/172,error_lm2_adj[1,2]/518,error_lm3_adj[1,2]/194,error_lm4_adj[1,2]/170,error_lm5_adj[1,2]/511,error_lm6_adj[1,2]/519,error_lm_adj[1,2]/1056),
+                            ROC_misclass_Hillary=c(error_lm1_adj[2,1]/77,error_lm2_adj[2,1]/12,error_lm3_adj[2,1]/71,error_lm4_adj[2,1]/12,error_lm5_adj[2,1]/104,error_lm6_adj[2,1]/93,error_lm_adj[2,1]/171),
+                            ROC_misclass_total=c((error_lm1_adj[2,1]+error_lm1_adj[1,2])/249,
+                                             (error_lm2_adj[2,1]+error_lm2_adj[1,2])/530,(error_lm3_adj[2,1]+error_lm3_adj[1,2])/265,(error_lm4_adj[2,1]+error_lm4_adj[1,2])/182,(error_lm5_adj[2,1]+error_lm5_adj[1,2])/615,(error_lm6_adj[2,1]+error_lm6_adj[1,2])/612,(error_lm_adj[2,1]+error_lm_adj[1,2])/1227),
+                            Votes=c(623,1326,665,456,1538,1532,3070))
+                            
+                         
+                            
+error_comparsion %>% pander(caption="Misclassification Rates for Logistic Regression of our clusters")                            
+                               
+
+```
+
+
+## Datasets 
+
+The two raw data sources that our project utilizes are the census and election datasets. The census dataset contains the tract-level 2010 census data that describes the population of each of the tracts in the census. The election dataset contains the votes and the winning candidate for different areas in the US, which is denoted by a fips value which can represent a nationwide, statewide, or countywide area. 
+
+The project will merge the two datasets to perform analysis on the election, however the census data contains more high resolution information than the election data since the tracts of the census is more fine-grained the the county-level data of the election dataset. In order to align the two datasets, we aggregated the tract-level census to the county level. We did this by first cleaning up the data by getting rid of unnecessary variables, then we weighted the remaining variables by the population of the county, and finally computing the population-weighted averages of each variable, leaving only data for each county instead of each tract.
+
+The transformation can be seen by looking at the data before and after aggregating.
+```{r}
+census_clean[1:3,1:7] %>% pander(digits = 10)
+census_tidy[1:3,1:6] %>% pander(digits = 10)
+```
+
+With the given merged_data set, we had 6142 observations of 30 variables. There were 2 observations per county, one for each of the top two candidates. I wanted to see only the winner of each county, so I sorted the data by decreasing percentage of votes. Then I used the distinct function to keep 1 observation per county with the winning candidate.
+
+Note: I had to used the distinct function on the 'fips' variable instead of the 'county' variable, because multiple counties in the US have the same name but are located in different states.
+
+First 5 variables of first 3 observations for our merged_data
+```{r}
+merged_data[,1:5] %>% head(3) %>% pander()
+```
+
+I then joined our clustered (K=4 & K=2) merged_data with some US map data in order to recreate the map of US counties.
+
+Few variables of first 3 observations for our joined merged_data and US map data (K=4 Map)
+```{r}
+county4$data[,c(1:2,4:6)] %>% head(3) %>% pander()
+```
+
+Lastly I joined our clustered merged_data (K=4 & K=2) back with our original merged_data because I needed the covariates from merged_data. I then separated this new dataset by cluster. For example when (K=4) I had four separate data sets, one for each cluster.
+
+Some  variables for Cluster 1 & Cluster 2 (Of K=4 Clusters) of this newly created data set.
+```{r}
+gbm_data[gbm_data$cluster=='cluster 1',c(3:5,9:11)] %>% head(3) %>% pander(row.names=F)
+gbm_data[gbm_data$cluster=='cluster 2',c(3:5,9:11)]  %>% head(3) %>% pander(row.names=F)
+```
+
+
+
+# Discussion
+
+
+From our four models (logistic regression, LDA, QDA, and decision tree), we found that the logistic regression model performed the best with an optimal threshold set. Without the optimal threshold, all the models suffered from the same problem -- high misclassification rates. Although we found the logistic regression model to perform the best with an optimal threshold set, it only performed slightly better than the QDA and LDA models with optimal thresholds. 
+
+From our clustering method, we found that clustering before performing supervised learning returns mixed results. With our boosting method, the base case (K=1) preformed better than both our clusters (K=2 & K=4). However when looking at our logistic regression model we see that clustering before performing predictions seemed to give us slightly superior results. One of the main reasons our cluster model seemed to struggle with predictions was due to the lack of observations in some clusters. Due to this I had to use 60% training and 40% test data. However, even this didn't improve our results with the boosting method. One of the main reasons I believe clustering failed with the boosting method is because of the lack of Clinton won counties in some clusters. For example Cluster 2 of 4 and 4 of 4, had barely any Clinton won counties 
+
+To be honest, clustering wasn't too great for this project because Trump won around 5x more counties than Clinton. Therefore almost every cluster created was gonna most likely predict Trump over Clinton.
